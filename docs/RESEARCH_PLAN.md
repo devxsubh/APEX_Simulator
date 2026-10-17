@@ -1,6 +1,6 @@
 # APEX Phase 3 plan: load-tracking fidelity and frequency selection
 
-Status: draft for the three authors to review. Nothing below is implemented yet.
+Status: draft for the three authors to review. Week 2 (PELT port, tick, CSV, seeds) is implemented; see README.
 
 ## 1. Why pivot
 
@@ -49,25 +49,28 @@ dynamic tracking error, so the arithmetic is not where the problem is.*
 
 ## 3. Theory (contribution 1)
 
-Notation: one PELT period = 1024 µs, `y = 2^(-1/P)` with `P = H / 1.024 ms` periods. Util is normalized to
-[0, 1] at max capacity.
+Notation: one PELT period is 1024 x 1024 ns = 1.048576 ms (the kernel shifts ns right by 10, then counts
+1024 of those units), and `y = 2^(-1/32)` per period. The PELT multiplier makes the clock run 2x or 4x
+faster. Util is normalized to [0, 1] at max capacity.
 
 **Ramp time (open loop, at f_max).** For a task that starts running continuously from util 0,
-`u(n) = 1 - y^n`. It reaches fraction `a` after `n_a = P * log2(1 / (1 - a))` periods.
+`u(n) = 1 - y^n`. It reaches fraction `a` after `n_a = 32 * log2(1 / (1 - a))` periods.
 
-| H | to 80% | to 95% |
-|---|--------|--------|
-| 32 ms | 74.3 ms | 138.3 ms |
-| 16 ms | 37.2 ms | 69.2 ms |
-| 8 ms | 18.6 ms | 34.6 ms |
+| Half-life setting | to 80% | to 95% | simulated (80% / 95%) |
+|-------------------|--------|--------|-----------------------|
+| 32 periods (x1) | 77.9 ms | 145.0 ms | 79.0 / 146.1 ms |
+| 16 periods (x2) | 39.0 ms | 72.5 ms | 39.1 / 72.7 ms |
+| 8 periods (x4) | 19.5 ms | 36.3 ms | 20.3 / 37.0 ms |
 
-The 32 ms row reproduces Qualcomm's ~74 ms / ~139 ms figures, which is a useful sanity anchor.
+Qualcomm's ~74 ms / ~139 ms figures are the same formula with a 1 ms period. The simulated column comes from
+`./apex_sim trace --workload step` (week 2), sampled every period with PELT updates at HZ = 250.
 
 **Steady-state ripple.** For a task that runs `r` periods and sleeps `s` (period `p = r + s`):
 - `u_max = (1 - y^r) / (1 - y^p)`
 - `u_min = u_max * y^s`
 
-At H = 32 ms with 25% duty, util swings 0.22–0.28 for a 16 ms period but 0.01–0.75 for a 256 ms period.
+At the 32-period setting with 25% duty, util swings 0.22–0.28 for a 16-period cycle but 0.01–0.75 for a 256-period
+cycle. Simulated with a 256 ms period: 14–752 (out of 1024) against 12–771 predicted.
 That swing is what drives OPP flapping. We'll predict flapping from `(p, duty, H)` and the OPP table.
 
 **Closed loop with frequency invariance (new work).** At frequency `f`, a busy period contributes
@@ -91,7 +94,7 @@ really does take longer. Each new piece is a separate module so it can be tested
 
 | Module | Contents | Validated against |
 |--------|----------|-------------------|
-| `src/pelt.c` | Integer port of `decay_load()`, `accumulate_sum()` and `__accumulate_pelt_segments()`, with frequency and capacity invariance, and the half-life multiplier (x1/x2/x4) | Bit-exact unit tests against values from the kernel source; LISA's PELT simulator |
+| `src/pelt.c` (done) | Integer port of `decay_load()`, `accumulate_sum()` and `__accumulate_pelt_segments()`, with frequency and capacity invariance, and the half-life multiplier (x1/x2/x4; out-of-tree patch, not found in mainline `pelt.c`) | Bit-exact unit tests against values from the kernel source; LISA's PELT simulator |
 | `src/util_est.c` | `util_est` update and EWMA as in `kernel/sched/fair.c` (read the current source; it has changed across versions) | Hand-computed traces |
 | `src/walt.c` | Window-based, non-decaying demand (window W, last N windows; policies max / avg / max(recent, avg), as in the 2016 RFC) | Hand-computed traces |
 | `src/oracle.c` | True demand from the workload generator (the reference everything is compared against) | Definition |

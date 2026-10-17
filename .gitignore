@@ -14,3 +14,6 @@ apex_sim_modular
 # Generated outputs
 apex_notebook_outputs/
 result/
+tests/test_pelt
+tests/pelt_replay
+*.csv

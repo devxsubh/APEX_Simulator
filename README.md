@@ -12,9 +12,50 @@ same sources; the second name exists only for older notebooks.
 
 ```bash
 make all                          # builds apex_sim and apex_sim_modular
-./apex_sim --experiment all       # or 1, 2, 3, 4, 5, 6
+./apex_sim --experiment all       # Phase 2 experiments: all, or 1-6
 make check                        # exits non-zero if any Experiment 4 bound is violated
+make test                         # PELT unit tests + differential test (needs python3)
+./apex_sim trace --workload step  # Phase 3 PELT trace engine; run with no options for help
 ```
+
+## Phase 3: PELT trace engine (in progress)
+
+The project is pivoting to load-tracking fidelity and its effect on frequency selection; see
+[docs/RESEARCH_PLAN.md](docs/RESEARCH_PLAN.md). Week 2 of that plan is in place:
+
+- **`src/pelt.c`**: integer port of Linux PELT (`decay_load`, `accumulate_sum`, `__accumulate_pelt_segments`,
+  `___update_load_sum`, `___update_load_avg`, rq `clock_pelt` with capacity and frequency invariance, idle
+  sync and `lost_idle_time`). It was checked line by line against torvalds/linux master on 2026-10-18. The
+  x2/x4 PELT multiplier follows the out-of-tree v2 patch; it is not in mainline `pelt.c`.
+- **`src/trace.c`**: single-CPU discrete-event engine. PELT updates happen where the kernel does them
+  (scheduler tick, enqueue, dequeue, context switch). Signals are sampled every PELT period
+  (1024 x 1024 ns) without changing state. Work is measured at full capacity, so lower frequency means
+  longer run time.
+- **`src/workload.c`, `src/rng.c`**: seeded `step`, `periodic`, `bursty` and `phase` workloads using
+  SplitMix64, so a seed reproduces exactly on any platform. `--seeds K` reports mean and 95% CI.
+- **CSV**: `--csv FILE` writes one row per sample for the CPU and each task: `on_rq`, `running`,
+  pending work, `util_avg`, `load_avg`, `runnable_avg`.
+
+```bash
+./apex_sim trace --workload step --start-ms 50 --stop-ms 1050 --duration-ms 1100 --halflife 16
+./apex_sim trace --workload bursty --tasks 3 --seeds 30 --csv bursty.csv
+./apex_sim trace --workload periodic --period-ms 16 --duty 0.25 --freq-scale 512
+```
+
+How the port is tested (`make test`):
+
+| Test | What it shows |
+|------|---------------|
+| Table and `LOAD_AVG_MAX` regenerated with the kernel's own generator formula | Constants are the kernel's |
+| `decay_load` edge cases and monotonicity; segment arithmetic | Integer behaviour, including truncation, matches the kernel's |
+| Saturation (util reaches 1020–1024), one half-life of running gives about 512, one half-life of sleep halves it | Basic PELT dynamics |
+| Ramp to 80% / 95% within 1 sample + 3% of `32 log2(1/(1-a))` periods, for x1/x2/x4 | Simulator agrees with the ramp model |
+| 25%-duty task reads about 256 at full and at half frequency | Frequency invariance works through the idle sync |
+| Same seed reproduces exactly; different seeds differ | Seeding |
+| Differential test: about 45k random updates, bit-identical to `tests/pelt_ref.py`, with UBSan aborting on undefined behaviour; a single table entry off by one is detected | No integer-width or overflow bugs in the C port |
+
+Not yet validated: comparison with real kernel traces (PELT tracepoints on hardware, plan week 6–8) and with
+LISA's PELT simulator. util_est, WALT-style tracking, schedutil and the energy model are weeks 4–5.
 
 ## Approximation modes
 
@@ -113,8 +154,12 @@ What the honest numbers show (arm64 laptop, `-O2`):
 ```text
 .
 ├── Makefile
+├── docs/      RESEARCH_PLAN.md
 ├── include/   apex_types.h approx.h sim.h experiments.h tcp_cubic.h bench.h
+│              pelt.h trace.h workload.h rng.h
 ├── src/       main.c approx.c sim.c experiments.c tcp_cubic.c bench.c
+│              pelt.c trace.c workload.c rng.c
+├── tests/     test_pelt.c pelt_replay.c pelt_ref.py
 ├── ieee_report.md                 (stale, see Known limitations)
 ├── apex_complete_analysis.ipynb   (stale)
 ├── generate_notebook.py           (stale)
