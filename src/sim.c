@@ -6,6 +6,11 @@
 #include <math.h>
 #include <stdio.h>
 
+static double load_coupling = DEFAULT_LOAD_COUPLING;
+
+void sim_set_load_coupling(double coupling) { load_coupling = coupling; }
+double sim_get_load_coupling(void) { return load_coupling; }
+
 static double max_vruntime_diff(Task *tasks, int n) {
     double max_diff = 0.0;
     for (int i = 0; i < n; i++) {
@@ -39,6 +44,7 @@ static void normalize_vruntimes(Task *tasks, int n) {
     for (int i = 0; i < n; i++) {
         tasks[i].vruntime -= min_vrt;
         tasks[i].load_avg = 0.0;
+        tasks[i].load_avg_exact = 0.0;
     }
 }
 
@@ -84,8 +90,6 @@ void init_mixed(Task *tasks, int *n) {
     tasks[0].nice = -10;
     tasks[0].weight = weight_from_nice(-10);
     tasks[0].effective_weight = (double)tasks[0].weight;
-    tasks[0].ideal_vruntime = 0.0;
-    tasks[0].vruntime_drift = 0.0;
     tasks[0].runnable = true;
     tasks[0].load_current = 1.0;
     for (int i = 1; i < *n; i++) {
@@ -94,8 +98,6 @@ void init_mixed(Task *tasks, int *n) {
         tasks[i].nice = 0;
         tasks[i].weight = weight_from_nice(0);
         tasks[i].effective_weight = (double)tasks[i].weight;
-        tasks[i].ideal_vruntime = 0.0;
-        tasks[i].vruntime_drift = 0.0;
         tasks[i].runnable = true;
         tasks[i].load_current = 1.0;
     }
@@ -114,7 +116,8 @@ void init_20_mixed(Task *tasks, int *n) {
     }
 }
 
-Result run_simulation(Task *tasks, int n, int ticks, ApproxMode mode, bool phased, ControllerPhaseResult *phase_out) {
+Result run_simulation(Task *tasks, int n, int ticks, ApproxMode mode, bool phased,
+                      ControllerPhaseResult *phase_out, int *chosen_trace) {
     Result out = {0};
     Controller c = {0};
     c.requested_mode = mode;
@@ -124,11 +127,6 @@ Result run_simulation(Task *tasks, int n, int ticks, ApproxMode mode, bool phase
     for (int i = 0; i < n; i++) {
         if ((double)tasks[i].weight < w_min) w_min = (double)tasks[i].weight;
     }
-
-    if (mode == MODE_LINEAR) out.theo_bound_pct = 0.05;
-    else if (mode == MODE_LUT256) out.theo_bound_pct = 0.5;
-    else if (mode == MODE_POLY2) out.theo_bound_pct = 0.00135;
-    else if (mode == MODE_ADAPTIVE) out.theo_bound_pct = 0.5;
 
     if (phased) normalize_vruntimes(tasks, n);
     for (int tick = 0; tick < ticks; tick++) {
@@ -144,22 +142,29 @@ Result run_simulation(Task *tasks, int n, int ticks, ApproxMode mode, bool phase
         }
         int phase = tick < 500 ? 0 : (tick < 1500 ? 1 : 2);
 
-        double dec_e = exact_decay(TICK_SECONDS);
-        double dec_a = mode_decay(mode, c.state, TICK_SECONDS);
-        double decay_err = fabs(dec_e - dec_a) / dec_e * 100.0;
-        if (decay_err > out.max_error_pct) out.max_error_pct = decay_err;
-
         for (int i = 0; i < n; i++) {
             tasks[i].load_current = tasks[i].runnable ? (1.0 / (1.0 + (double)tasks[i].wait_ticks_since_run)) : 0.0;
             double decay_window = TICK_SECONDS * (1.0 + 0.05 * (double)tasks[i].wait_ticks_since_run);
             double d = mode_decay(mode, c.state, decay_window);
+            double d_exact = exact_decay(decay_window);
             tasks[i].load_avg = tasks[i].load_avg * d + tasks[i].load_current * (1.0 - d);
-            double load_factor = 1.0 + (tasks[i].load_avg - 0.5) * 0.02;
+            /* Shadow tracker sees identical inputs, so any gap is pure arithmetic error. */
+            tasks[i].load_avg_exact = tasks[i].load_avg_exact * d_exact + tasks[i].load_current * (1.0 - d_exact);
+
+            double step_err = fabs(d - d_exact);
+            double load_err = fabs(tasks[i].load_avg - tasks[i].load_avg_exact);
+            if (step_err > out.max_step_abs_err) out.max_step_abs_err = step_err;
+            if (d > out.max_approx_decay) out.max_approx_decay = d;
+            if (decay_window > out.max_window_s) out.max_window_s = decay_window;
+            if (load_err > out.max_load_abs_err) out.max_load_abs_err = load_err;
+
+            double load_factor = 1.0 + (tasks[i].load_avg - 0.5) * load_coupling;
             if (load_factor < 0.25) load_factor = 0.25;
             tasks[i].effective_weight = (double)tasks[i].weight * load_factor;
         }
 
         int chosen = select_task(tasks, n);
+        if (chosen_trace) chosen_trace[tick] = chosen;
         if (chosen < 0) continue;
         for (int i = 0; i < n; i++) {
             if (!tasks[i].runnable || i == chosen) continue;
@@ -176,24 +181,12 @@ Result run_simulation(Task *tasks, int n, int ticks, ApproxMode mode, bool phase
         tasks[chosen].exec_ticks++;
         total_exec++;
         tasks[chosen].wait_ticks_since_run = 0;
-        double weight_for_vruntime = tasks[chosen].effective_weight;
-        if (n == 11) {
-            double decay_window = TICK_SECONDS *
-                (1.0 + 0.05 * (double)tasks[chosen].wait_ticks_since_run);
-            double d_exact  = exact_decay(decay_window);
-            double d_approx = mode_decay(mode, c.state, decay_window);
-            double decay_error = fabs(d_exact - d_approx);
-            double weight_reduction = decay_error * (double)tasks[chosen].weight * 32.0;
-            double reduced_weight = (double)tasks[chosen].weight - weight_reduction;
-            if (reduced_weight < 1.0) reduced_weight = 1.0;
-            weight_for_vruntime = reduced_weight;
-        }
-        tasks[chosen].vruntime += (32.0 * 1024.0) / weight_for_vruntime;
-        double ideal_advance = (32.0 * 1024.0) / (double)tasks[chosen].weight;
-        tasks[chosen].ideal_vruntime += ideal_advance;
-        tasks[chosen].vruntime_drift = fabs(tasks[chosen].vruntime - tasks[chosen].ideal_vruntime);
+        tasks[chosen].vruntime += (32.0 * 1024.0) / tasks[chosen].effective_weight;
 
         out.fairness_violation = phased ? max_vruntime_diff_runnable(tasks, n) : max_vruntime_diff(tasks, n);
+        if (!phased && out.fairness_violation > out.max_vruntime_gap) {
+            out.max_vruntime_gap = out.fairness_violation;
+        }
         if (phased) {
             double mean_vrt = 0.0;
             int runnable_count = 0;
@@ -221,11 +214,8 @@ Result run_simulation(Task *tasks, int n, int ticks, ApproxMode mode, bool phase
         tick_controller_counters(&c, phase, phase_out);
     }
 
-    double min_v = tasks[0].vruntime, max_v = tasks[0].vruntime;
     double mean_v = 0.0;
     for (int i = 0; i < n; i++) {
-        if (tasks[i].vruntime < min_v) min_v = tasks[i].vruntime;
-        if (tasks[i].vruntime > max_v) max_v = tasks[i].vruntime;
         mean_v += tasks[i].vruntime;
         out.starvation_count += tasks[i].starvation_events;
         if (tasks[i].max_wait_ticks > out.max_wait_ticks) out.max_wait_ticks = tasks[i].max_wait_ticks;
@@ -241,25 +231,8 @@ Result run_simulation(Task *tasks, int n, int ticks, ApproxMode mode, bool phase
     } else {
         out.max_vruntime_dev_pct = 0.0;
     }
-    if (n == 11) {
-        double mean_batch_v = 0.0;
-        int batch_count = 0;
-        for (int i = 1; i < n; i++) {
-            if (tasks[i].weight == 1024) {
-                mean_batch_v += tasks[i].vruntime;
-                batch_count++;
-            }
-        }
-        if (batch_count > 0) {
-            mean_batch_v /= (double)batch_count;
-            if (fabs(mean_batch_v) > 1e-9) {
-                out.fairness_violation = fabs(tasks[0].vruntime - mean_batch_v) / fabs(mean_batch_v);
-            }
-        }
-    }
     out.avg_wait_ticks = total_exec > 0 ? (double)total_wait / total_exec : 0.0;
-    out.violations = (out.max_error_pct > out.theo_bound_pct + 1e-4) ? 1 : 0;
-    if (mode == MODE_ADAPTIVE && c.reaction_seen) out.avg_wait_ticks = c.reaction_ticks;
+    out.reaction_ticks = c.reaction_seen ? c.reaction_ticks : -1;
     out.safe_to_caution = c.safe_to_caution;
     out.caution_to_strict = c.caution_to_strict;
     out.strict_to_caution = c.strict_to_caution;

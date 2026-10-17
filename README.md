@@ -1,399 +1,167 @@
-# APEX Simulator (Phase 1 Research)
+# APEX-CFS Simulator
 
-This project is a research simulator for approximate computing in OS-kernel internals.
+A userspace research simulator for approximate arithmetic in OS-kernel internals. It models:
 
-It models two subsystems:
+- CFS-style load-tracking decay (`e^(-lambda t)`) and its approximations
+- the cube root used to compute `K` in TCP CUBIC
 
-- Linux CFS scheduler load-tracking decay (`e^(-lambda t)`) approximations
-- TCP CUBIC cube-root approximations used in window update flow
+There is one codebase (`src/*.c`, `include/*.h`). `apex_sim` and `apex_sim_modular` are built from the
+same sources; the second name exists only for older notebooks.
 
-The simulator is provided in two forms:
+## Build and run
 
-- Single-file: `apex_sim.c`
-- Modular: `src/*.c` + `include/*.h`
+```bash
+make all                          # builds apex_sim and apex_sim_modular
+./apex_sim --experiment all       # Phase 2 experiments: all, or 1-6
+make check                        # exits non-zero if any Experiment 4 bound is violated
+make test                         # PELT unit tests + differential test (needs python3)
+./apex_sim trace --workload step  # Phase 3 PELT trace engine; run with no options for help
+```
 
-## Theorem Mapping
+## Phase 3: PELT trace engine (in progress)
 
-- **Theorem 1 (starvation prevention)**: controller keeps approximation strictness bounded by fairness thresholds tied to `w_min`.
-  - fairness metric = maximum pairwise vruntime gap
-  - starvation monitor = no task should exceed `2 x scheduling_period` equivalent threshold
-- **Theorem 2 (cumulative error bound)**: Experiment 4 validates per-tick decay approximation errors against theoretical bounds for each mode.
+The project is pivoting to load-tracking fidelity and its effect on frequency selection; see
+[docs/RESEARCH_PLAN.md](docs/RESEARCH_PLAN.md). Week 2 of that plan is in place:
 
-## Approximation Modes
+- **`src/pelt.c`**: integer port of Linux PELT (`decay_load`, `accumulate_sum`, `__accumulate_pelt_segments`,
+  `___update_load_sum`, `___update_load_avg`, rq `clock_pelt` with capacity and frequency invariance, idle
+  sync and `lost_idle_time`). It was checked line by line against torvalds/linux master on 2026-10-18. The
+  x2/x4 PELT multiplier follows the out-of-tree v2 patch; it is not in mainline `pelt.c`.
+- **`src/trace.c`**: single-CPU discrete-event engine. PELT updates happen where the kernel does them
+  (scheduler tick, enqueue, dequeue, context switch). Signals are sampled every PELT period
+  (1024 x 1024 ns) without changing state. Work is measured at full capacity, so lower frequency means
+  longer run time.
+- **`src/workload.c`, `src/rng.c`**: seeded `step`, `periodic`, `bursty` and `phase` workloads using
+  SplitMix64, so a seed reproduces exactly on any platform. `--seeds K` reports mean and 95% CI.
+- **CSV**: `--csv FILE` writes one row per sample for the CPU and each task: `on_rq`, `running`,
+  pending work, `util_avg`, `load_avg`, `runnable_avg`.
 
-- `EXACT`: exact decay and exact CUBIC (LUT + Newton step)
-- `LINEAR`: `1 - lambda t` for scheduler decay
-- `LUT256`: 256-entry scheduler decay lookup
-- `POLY2`: `1 - lambda t + (lambda t)^2/2` via Horner form
-- `ADAPTIVE`: safety controller state machine:
-  - `SAFE` -> decay=`POLY2`, CUBIC=`LUT-only`
-  - `CAUTION` -> decay=`LUT256`, CUBIC=`LUT-only`
-  - `STRICT` -> exact decay and exact CUBIC
+```bash
+./apex_sim trace --workload step --start-ms 50 --stop-ms 1050 --duration-ms 1100 --halflife 16
+./apex_sim trace --workload bursty --tasks 3 --seeds 30 --csv bursty.csv
+./apex_sim trace --workload periodic --period-ms 16 --duty 0.25 --freq-scale 512
+```
 
-Controller monitor interval is **8 ticks** with transitions:
+How the port is tested (`make test`):
 
-- `SAFE -> CAUTION` when fairness violation `> 0.05 * w_min`
-- `CAUTION -> STRICT` when fairness violation `> 0.10 * w_min`
-- `CAUTION -> SAFE` when fairness violation `< 0.02 * w_min`
-- `STRICT -> CAUTION` when fairness violation `< 0.04 * w_min`
+| Test | What it shows |
+|------|---------------|
+| Table and `LOAD_AVG_MAX` regenerated with the kernel's own generator formula | Constants are the kernel's |
+| `decay_load` edge cases and monotonicity; segment arithmetic | Integer behaviour, including truncation, matches the kernel's |
+| Saturation (util reaches 1020–1024), one half-life of running gives about 512, one half-life of sleep halves it | Basic PELT dynamics |
+| Ramp to 80% / 95% within 1 sample + 3% of `32 log2(1/(1-a))` periods, for x1/x2/x4 | Simulator agrees with the ramp model |
+| 25%-duty task reads about 256 at full and at half frequency | Frequency invariance works through the idle sync |
+| Same seed reproduces exactly; different seeds differ | Seeding |
+| Differential test: about 45k random updates, bit-identical to `tests/pelt_ref.py`, with UBSan aborting on undefined behaviour; a single table entry off by one is detected | No integer-width or overflow bugs in the C port |
+
+Not yet validated: comparison with real kernel traces (PELT tracepoints on hardware, plan week 6–8) and with
+LISA's PELT simulator. util_est, WALT-style tracking, schedutil and the energy model are weeks 4–5.
+
+## Approximation modes
+
+| Mode | Decay `d(t)` | Per-step error bound (analytic, `x = lambda t`) |
+|------|--------------|--------------------------------------------------|
+| `EXACT` | `exp(-lambda t)` | 0 |
+| `LINEAR` | `1 - x` (clamped) | `x^2 / 2` |
+| `LUT256` | 256-entry table, index `round(t / dt)`, values rounded to 4 decimals | `lambda dt / 2 + 5.1e-5` |
+| `POLY2` | `1 - x + x^2/2` (clamped) | `x^3 / 6` |
+| `ADAPTIVE` | controller picks POLY2 (SAFE), LUT256 (CAUTION), EXACT (STRICT) | worst of its states |
+
+The controller samples every 8 ticks (256 ms at 32 ms/tick) and moves between states using thresholds
+`0.05 / 0.10 / 0.02 / 0.04 * w_min` on a fairness signal (see Known limitations).
 
 ## Experiments
 
-- **Experiment 1**: Equal-weight fairness (`N=10, 50, 100`)
-- **Experiment 2**: Mixed-weight starvation test (`nice=-10` task + 10 `nice=0` tasks)
-- **Experiment 3**: Safety controller dynamics across phased load
-- **Experiment 4**: Error bound verification (Theorem 2)
-- **Experiment 5**: TCP CUBIC approximation (unique contribution)
+| # | What it measures |
+|---|------------------|
+| 1 | Equal-weight fairness for N = 10, 50, 100: vruntime std-dev %, max pairwise vruntime gap, starvation |
+| 2 | One nice -10 task vs ten nice 0 tasks. Each mode is run on the same workload as EXACT and compared tick by tick: % of scheduling decisions that differ, first divergence tick, final vruntime gap in nice-0 slices |
+| 2b | Same comparison at load coupling 0.02 / 0.2 / 1.0, to show how much the result depends on that modeling assumption |
+| 3 | ADAPTIVE controller over a phased load (5, 55, 15 runnable tasks), reaction time and state transitions |
+| 4 | Theorem 2: analytic per-step and cumulative load-error bounds vs a shadow exact tracker, on two workloads |
+| 5 | CUBIC cube root: LUT + one Newton step vs LUT only. Accuracy against `cbrt()` and measured ns/op |
+| 6 | Measured ns/op of each decay variant, plus max error on the windows the simulator uses |
 
-All experiment outputs are printed as markdown tables.
+### Theorem 2 (cumulative load error)
 
-## Current State Snapshot (Latest Run)
+Let `L' = d L + (1-d) c` and `L~' = d~ L~ + (1-d~) c` run on the same inputs `c in [0,1]`, starting at the
+same value. If `|d~ - d| <= delta` and `d~ <= D < 1` at every step, then `|L~ - L| <= delta / (1 - D)` at
+every step.
 
-The latest exported report (`apex_outputs_for_claude.json`) was generated from:
+Proof: `e' = d~ e + (d~ - d)(L - c)`. Since `L, c in [0,1]`, `|L - c| <= 1`, so `|e'| <= D|e| + delta`.
+Unrolling from `e_0 = 0` gives `|e_k| <= delta (1 - D^k) / (1 - D)`.
 
-- build command: `make all`
-- run command: `./apex_sim_modular --experiment all`
-- build status: success (`returncode = 0`)
-- run status: success (`returncode = 0`)
+`delta` comes from the per-step bounds in the table above, evaluated at the largest decay window the run
+used. `D` is the largest approximate decay value on that window range; every variant is monotone or convex
+there, so the largest value is at an endpoint. Each task carries `load_avg_exact`, an exact tracker fed the
+same inputs, so the observed error is pure arithmetic error.
 
-Observed behavior summary:
+## What changed in this iteration (integrity fixes)
 
-- **Experiment 1**
-  - all modes show very small `vdev%` values (roughly `0.0014` to `0.0038`)
-  - `ADAPTIVE` currently matches `LUT256` in this workload (not `EXACT`)
-- **Experiment 2**
-  - modes are non-identical
-  - `ADAPTIVE` is currently close to `EXACT`
-  - no starvation events observed
-- **Experiment 3**
-  - controller reacts quickly (`4` ticks)
-  - transitions observed in all key directions (`SAFE->CAUTION`, `CAUTION->STRICT`, `STRICT->CAUTION`, `CAUTION->SAFE`)
-  - fairness values are printed as normalized percentages and can be large under burst contention
-- **Experiment 4**
-  - all modes pass theoretical bound checks (`Verified = YES`)
-  - no violations observed
-- **Experiment 5**
-  - CUBIC approximation remains strong and stable
-  - reported speedup: `2.67x`
+| Before | Now |
+|--------|-----|
+| CUBIC "2.67x speedup" from hardcoded 80 / 30 cycles and an unrelated citation | Measured ns/op with a call-only baseline subtracted |
+| Experiment 2 separated modes through an `if (n == 11)` branch that scaled decay error by weight x 32 | Branch removed. Modes are compared against a paired EXACT run on the same workload |
+| Per-task decay window in that branch was always 32 ms (wait counter reset before use) | Removed together with the branch |
+| Experiment 4 checked one fixed value (decay at t = 32 ms) against bounds chosen after the fact | Analytic per-step and cumulative bounds checked against a shadow exact tracker over the whole run |
+| Reaction time stored in `avg_wait_ticks`; "8 ticks = 8 ms"; "reacted within 1 interval" always printed | Separate `reaction_ticks`, correct 256 ms interval, conditional message |
+| "Max Fairness Violation" in Experiment 1 was the last tick's value | Max over all ticks |
+| Two copies of the simulator (`apex_sim.c` and `src/`) that had already drifted apart | One codebase |
 
-Important interpretation note:
+What the honest numbers show (arm64 laptop, `-O2`):
 
-- In Experiment 3, the printed fairness numbers are **normalized max pairwise vruntime gap vs mean vruntime** (not CPU share percentages), so high values during heavy contention are expected.
+- Approximation hardly changes scheduling unless load is fed back into weights strongly. At coupling 0.02,
+  POLY2 and ADAPTIVE make the same decisions as EXACT. LINEAR differs on 0.9% of ticks; LUT256 on 14%.
+- LUT256 has the largest per-step error (about 1.1e-2), not the smallest. Rounding a fractional window to
+  the nearest table index costs up to `lambda dt / 2`. The old single-point check could not see this.
+- Every analytic bound holds. For the fixed modes the per-step bounds are tight (observed is 94% to 97% of the
+  bound); the cumulative bound is loose (observed is 0.1% to 5% of the bound).
+- `exp()` costs about 1.7 ns net. POLY2 costs about 0.3 ns. LINEAR and LUT256 are below what this
+  benchmark can resolve.
+- Dropping the Newton step from the cube root saves about 0.3 ns per call. The old 2.67x figure is not supported.
 
-## File Structure
+## Known limitations
+
+- **Load coupling is invented.** Effective weight is `weight * (1 + 0.02 * (load_avg - 0.5))`. Real CFS does
+  not feed PELT into vruntime; PELT matters for load balancing and frequency selection (schedutil / EAS).
+  Experiment 2b shows the conclusions depend heavily on this constant.
+- **Controller signal and units.** Thresholds scaled by `w_min` are compared against vruntime gaps or, in
+  Experiment 3, a percentage. The signal reflects contention, not approximation error, so ADAPTIVE goes to
+  STRICT exactly when the load is heaviest.
+- **Floating point, not kernel fixed point.** Linux PELT already uses an integer table
+  (`runnable_avg_yN_inv`, `y^32 = 1/2`, 1024 us periods). The CUBIC routine here is not the kernel's
+  `cubic_root()`, which runs about once per congestion epoch.
+- **Throughput-style microbenchmark** through a function pointer. Functions cheaper than a call are
+  reported as `n/a`. It does not yet measure latency, use cycle counters, or run on x86.
+- **Synthetic, deterministic workloads.** There is no randomness, so there are no seeds or confidence
+  intervals yet.
+- **Stale documents.** `ieee_report.md`, `apex_complete_analysis.ipynb`, `generate_notebook.py` and
+  `notebook_source.py` still describe the old results and table headers.
+
+## Roadmap
+
+1. Kernel-faithful baselines: integer PELT `decay_load()` and the real `cubic_root()`, with approximations
+   that are cheaper than *those*.
+2. Better cost measurement: latency and throughput, cycle counters / `perf stat`, x86 and arm64, and how
+   often the kernel calls these paths.
+3. Randomized workloads with seeds and confidence intervals, and real `perf sched` traces.
+4. Follow the error to where PELT matters: frequency selection (schedutil) and energy.
+5. Controller driven by an error estimate (periodic shadow-exact sampling) instead of contention.
+6. Prototypes: approximate BPF CUBIC with `netem`, and a `sched_ext` scheduler with its own load tracking.
+
+## File structure
 
 ```text
 .
-├── apex_sim.c
-├── src/
-│   ├── main.c
-│   ├── approx.c
-│   ├── sim.c
-│   ├── experiments.c
-│   └── tcp_cubic.c
-├── include/
-│   ├── apex_types.h
-│   ├── approx.h
-│   ├── sim.h
-│   ├── experiments.h
-│   └── tcp_cubic.h
 ├── Makefile
-├── apex_analysis.ipynb
-└── README.md
+├── docs/      RESEARCH_PLAN.md
+├── include/   apex_types.h approx.h sim.h experiments.h tcp_cubic.h bench.h
+│              pelt.h trace.h workload.h rng.h
+├── src/       main.c approx.c sim.c experiments.c tcp_cubic.c bench.c
+│              pelt.c trace.c workload.c rng.c
+├── tests/     test_pelt.c pelt_replay.c pelt_ref.py
+├── ieee_report.md                 (stale, see Known limitations)
+├── apex_complete_analysis.ipynb   (stale)
+├── generate_notebook.py           (stale)
+└── notebook_source.py             (stale)
 ```
-
-## Build and Run
-
-```bash
-make single
-make modular
-make all
-make run
-make clean
-```
-
-CLI:
-
-```bash
-./apex_sim --experiment all
-./apex_sim --experiment 1
-./apex_sim --experiment 5
-```
-
-Modular binary:
-
-```bash
-./apex_sim_modular --experiment all
-```
-
-## Python Analysis Notebook
-
-Notebook: `apex_analysis.ipynb`
-
-It:
-
-- runs `make all`
-- captures simulator output
-- parses markdown tables into pandas DataFrames
-- creates requested plots:
-  - CPU share by mode (Experiment 2)
-  - error over ticks / bound summary (Experiment 4)
-  - cube-root vs window-size error (Experiment 5)
-  - adaptive state distribution by phase (Experiment 3)
-- reports statistical summary and timing (wall + CPU)
-
-Use `.venv` with `pandas numpy matplotlib jupyter`.
-
-## Architecture Overview
-
-There are two equivalent implementations:
-
-- Single-file implementation: `apex_sim.c`
-- Modular implementation: `src/*.c` with declarations in `include/*.h`
-
-Both produce the same experiment tables and are kept functionally aligned.
-
-Execution flow:
-
-1. `main` parses CLI argument (`--experiment all|1|2|3|4|5`)
-2. `init_luts()` prepares approximation lookup tables
-3. Selected experiment function initializes workload
-4. `run_simulation()` executes scheduler ticks and computes metrics
-5. Experiment function prints markdown table rows
-
----
-
-## File-by-File Guide
-
-### Top-level files
-
-- `README.md`: project and experiment documentation
-- `Makefile`: build targets for single/modular binaries
-- `apex_sim.c`: monolithic all-in-one simulator
-- `apex_analysis.ipynb`: analysis notebook (build, parse outputs, plots, JSON export)
-- `apex_outputs_for_claude.json`: generated report artifact from notebook
-
-### `include/` headers
-
-- `include/apex_types.h`
-  - Core constants and shared structs/enums:
-    - modes (`MODE_EXACT`, `MODE_LINEAR`, `MODE_LUT256`, `MODE_POLY2`, `MODE_ADAPTIVE`)
-    - controller states (`SAFE`, `CAUTION`, `STRICT`)
-    - scheduler task struct (`Task`)
-    - result structs (`Result`, `ControllerPhaseResult`, `CubicResult`)
-  - Key constants include:
-    - `APAF_MONITOR_INTERVAL = 8`
-    - `DECAY_LAMBDA = 0.693`
-    - `TICK_SECONDS = 0.032`
-- `include/approx.h`
-  - Approximation and controller APIs (`mode_decay`, `update_controller`, CUBIC helpers)
-- `include/sim.h`
-  - Simulation engine APIs (`init_equal`, `init_mixed`, `run_simulation`)
-- `include/experiments.h`
-  - Experiment print entry points (`print_experiment_1` ... `print_experiment_5`)
-- `include/tcp_cubic.h`
-  - CUBIC experiment API declarations
-
-### `src/` source files
-
-- `src/main.c`
-  - CLI entry point and experiment routing
-- `src/approx.c`
-  - Decay approximations (linear/LUT/poly2/exact)
-  - LUT initialization and quantization
-  - Adaptive controller transition logic and counters
-- `src/sim.c`
-  - Tick-level scheduler simulation, task selection, vruntime updates
-  - Fairness/starvation/latency/error metrics
-  - Phase transitions and controller monitoring
-- `src/experiments.c`
-  - Experiment setup and markdown table output formatting
-- `src/tcp_cubic.c`
-  - TCP CUBIC approximation experiment and reporting
-
----
-
-## Key Implementation Snippets
-
-### 1) Decay LUT quantization (intentional approximation)
-
-From `src/approx.c`:
-
-```c
-float q = (float)exp(-DECAY_LAMBDA * t);
-q = floorf(q * 10000.0f + 0.5f) / 10000.0f;
-decay_lut256[i] = (double)q;
-```
-
-Why: ensures LUT256 is not accidentally exact, producing realistic nonzero observed error in Experiment 4.
-
-### 2) Adaptive mode decay selection
-
-From `src/approx.c`:
-
-```c
-if (mode == MODE_ADAPTIVE) {
-    if (state == STATE_SAFE) return poly2_decay(seconds);
-    if (state == STATE_CAUTION) return lut256_decay(seconds);
-    return exact_decay(seconds);
-}
-```
-
-Why: adaptive controller trades speed for strictness based on fairness conditions.
-
-### 3) Controller thresholds and transitions
-
-From `src/approx.c`:
-
-```c
-double t1 = 0.05 * w_min;
-double t2 = 0.10 * w_min;
-double t3 = 0.02 * w_min;
-double t4 = 0.04 * w_min;
-```
-
-And transitions:
-
-```c
-if (c->state == STATE_SAFE && fairness_violation > t1) c->state = STATE_CAUTION;
-else if (c->state == STATE_CAUTION && fairness_violation > t2) c->state = STATE_STRICT;
-else if (c->state == STATE_CAUTION && fairness_violation < t3) c->state = STATE_SAFE;
-else if (c->state == STATE_STRICT && fairness_violation < t4) c->state = STATE_CAUTION;
-```
-
-Why: enforces Theorem 1-inspired safety bounds.
-
-### 4) Load-aware effective weight and vruntime update
-
-From `src/sim.c`:
-
-```c
-tasks[i].load_avg = tasks[i].load_avg * d + tasks[i].load_current * (1.0 - d);
-double load_factor = 1.0 + (tasks[i].load_avg - 0.5) * 0.02;
-tasks[i].effective_weight = (double)tasks[i].weight * load_factor;
-...
-tasks[chosen].vruntime += (32.0 * 1024.0) / weight_for_vruntime;
-```
-
-Why: makes approximation mode affect scheduling behavior instead of being a dead calculation.
-
-### 5) Phase-boundary normalization (Exp 3)
-
-From `src/sim.c`:
-
-```c
-if (phased && (tick == 500 || tick == 1500)) {
-    normalize_vruntimes(tasks, n);
-}
-```
-
-And normalization:
-
-```c
-tasks[i].vruntime -= min_vrt;
-tasks[i].load_avg = 0.0;
-```
-
-Why: prevents old-phase history from dominating new-phase dynamics.
-
-### 6) Fairness normalization for phased output
-
-From `src/sim.c`:
-
-```c
-out.fairness_violation = (out.fairness_violation / mean_vrt) * 100.0;
-```
-
-Why: prints fairness in percentage-like normalized units for easier interpretation across phases.
-
-### 7) Experiment 2 mixed-workload fairness metric
-
-From `src/sim.c`:
-
-```c
-out.fairness_violation = fabs(tasks[0].vruntime - mean_batch_v) / fabs(mean_batch_v);
-```
-
-Why: compares high-priority task progress against mean batch-task progress in mixed workload.
-
----
-
-## Build/Run Behavior and Common Confusion
-
-`make` targets:
-
-- `make single`: builds `./apex_sim`
-- `make modular`: builds `./apex_sim_modular`
-- `make all`: builds both
-- `make run`: builds/runs only `./apex_sim --experiment all`
-- `make clean`: deletes both binaries
-
-Important:
-
-- After `make clean`, running `./apex_sim` or `./apex_sim_modular` fails until rebuilt.
-- `./apex_sim.c` is source code, not an executable.
-
----
-
-## Notebook and JSON Report Workflow
-
-`apex_analysis.ipynb`:
-
-1. Uses project root dynamically (`Path.cwd()` fallback-safe)
-2. Runs `make all` and simulator commands
-3. Parses markdown tables into pandas DataFrames
-4. Builds summary statistics and plots
-5. Exports full artifact as `apex_outputs_for_claude.json`
-
-The JSON includes:
-
-- build metadata
-- full `--experiment all` stdout/stderr
-- parsed tables per experiment
-- per-experiment timing
-- numeric summary stats
-- raw output for each experiment invocation
-
----
-
-## What Was Updated During This Iteration
-
-- Path robustness:
-  - notebook root handling no longer hardcoded to a brittle absolute path
-  - README file tree root corrected after workspace move
-- Scheduler/metrics/controller updates:
-  - monitor interval constant unified as `APAF_MONITOR_INTERVAL`
-  - effective load-aware weight path active in scheduler loop
-  - Experiment 1 vdev metric computed from stddev/mean vruntime
-  - Experiment 2 mixed-workload fairness formula uses hiprio vs batch mean
-  - Experiment 3 phase-boundary vruntime/load normalization added
-  - Experiment 3 state transition counters printed
-  - Experiment 3 reaction-time interpretation lines added
-- Error-model realism:
-  - LUT256 quantization made explicit to avoid zero observed error
-  - POLY2 bound used as fixed realistic value (`0.00135%`)
-- JSON reporting:
-  - notebook now writes a structured shareable report for external review
-  - current report execution uses `./apex_sim_modular --experiment all` in the exported metadata
-
----
-
-## Validation Checklist
-
-For a clean local validation:
-
-```bash
-make clean
-make all
-./apex_sim --experiment all
-./apex_sim_modular --experiment all
-```
-
-Then regenerate notebook outputs:
-
-1. Run `apex_analysis.ipynb` top-to-bottom
-2. Run final export cell
-3. Confirm `apex_outputs_for_claude.json` updates
-
-# OS_implementation
-# OS_implementation
